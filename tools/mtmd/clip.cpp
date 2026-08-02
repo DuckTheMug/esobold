@@ -59,6 +59,7 @@
 #include "models/llama4.cpp"
 #include "models/llava.cpp"
 #include "models/minicpmv.cpp"
+#include "models/minimax-m3.cpp"
 #include "models/paddleocr.cpp"
 #include "models/pixtral.cpp"
 #include "models/qwen2vl.cpp"
@@ -963,6 +964,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_mimovl>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_MINIMAX_M3:
+            {
+                builder = std::make_unique<clip_graph_minimax_m3>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_STEP3VL:
             {
                 builder = std::make_unique<clip_graph_step3vl>(ctx, img);
@@ -1071,6 +1076,8 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
         default:
             GGML_ABORT("missing cgraph builder");
     }
+
+    builder->img_batch = &imgs;
 
     // TODO [QWEN_VIDEO]: improve this in the future
     builder->n_batch = imgs.entries.size();
@@ -1543,6 +1550,17 @@ struct clip_model_loader {
                         //     LOG_WRN("%s: more info: https://github.com/ggml-org/llama.cpp/issues/16842\n\n", __func__);
                         // }
                     } break;
+                case PROJECTOR_TYPE_MINIMAX_M3:
+                    {
+                        hparams.n_merge = 2; // spatial_merge_size
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC_PILLOW;
+                        hparams.image_resize_pad  = PAD_NONE;
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        hparams.rope_theta = 10000.0f; // vision_config.rope_theta
+                        // MiniMax-M3: max_pixels 451584 (=672^2) -> 576 merged tokens (image_seq_length)
+                        hparams.set_limit_image_tokens(8, 576);
+                        hparams.set_warmup_n_tokens(16*16);
+                    } break;
                 case PROJECTOR_TYPE_MIMOVL:
                     {
                         hparams.n_merge = 2; // spatial_merge_size
@@ -1656,7 +1674,16 @@ struct clip_model_loader {
                         get_u32(KEY_SAM_N_HEAD, hparams.sam_n_head, true);
                         get_u32(KEY_SAM_N_EMBD, hparams.sam_n_embd, true);
                         get_u32(KEY_ATTN_WINDOW_SIZE, hparams.attn_window_size, true);
+                        hparams.preproc_min_tiles = 2;
+                        if (model.proj_type == PROJECTOR_TYPE_DEEPSEEKOCR) {
+                            hparams.preproc_max_tiles = 9;
+                            hparams.preproc_tile_size = 640;
+                            // the CLIP/ViT body runs its layernorms at 1e-5 (the SAM stage uses 1e-6)
+                            hparams.eps = 1e-5f;
+                        }
                         if (model.proj_type == PROJECTOR_TYPE_DEEPSEEKOCR2) {
+                            hparams.preproc_max_tiles = 6;
+                            hparams.preproc_tile_size = 768;
                             // qwen2 encoder is GQA, requires KEY_N_HEAD_KV
                             get_u32(string_format(KEY_N_HEAD_KV, "vision"), hparams.n_head_kv);
                         }
@@ -2158,6 +2185,19 @@ struct clip_model_loader {
                     model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"), false);
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
+                } break;
+            case PROJECTOR_TYPE_MINIMAX_M3:
+                {
+                    // per-patch MLP: mm.1 -> gelu -> mm.2
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                    // 2x2 merge MLP: mm.merge.fc1 -> gelu -> mm.merge.fc2
+                    model.mm_merger_fc1_w = get_tensor(string_format(TN_MM_MERGER_FC1, "weight"));
+                    model.mm_merger_fc1_b = get_tensor(string_format(TN_MM_MERGER_FC1, "bias"));
+                    model.mm_merger_fc2_w = get_tensor(string_format(TN_MM_MERGER_FC2, "weight"));
+                    model.mm_merger_fc2_b = get_tensor(string_format(TN_MM_MERGER_FC2, "bias"));
                 } break;
             case PROJECTOR_TYPE_STEP3VL:
                 {
@@ -3332,6 +3372,9 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
             return (img->nx() / params.patch_size) / 2;
         case PROJECTOR_TYPE_STEP3VL:
             return img->nx() / (params.patch_size * params.n_merge);
+        case PROJECTOR_TYPE_DEEPSEEKOCR:
+        case PROJECTOR_TYPE_DEEPSEEKOCR2:
+            return (img->nx() / params.patch_size) / 4;
         default:
             break;
     }
@@ -3427,6 +3470,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
+        case PROJECTOR_TYPE_MINIMAX_M3:
         case PROJECTOR_TYPE_GLM4V:
         case PROJECTOR_TYPE_YOUTUVL:
             {
@@ -3541,10 +3585,17 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
             // E.g., 64x64 -> 16x16 patches
             n_patches /= 16;
 
-            // build_global_local_features adds image newlines and view separator
-            // Formula: h*(w+1) + 1 where h = w = sqrt(n_patches)
-            int h = static_cast<int>(std::sqrt(static_cast<float>(n_patches)));
-            n_patches = h * (h + 1) + 1;
+            if (img->add_viewsep) {
+                // global view: one image-newline per token-row + trailing view separator
+                const int h = static_cast<int>(std::sqrt(static_cast<float>(n_patches)));
+                n_patches = h * (h + 1) + 1;
+            } else if (img->ny() >= img->nx() && img->ny() % img->nx() == 0) {
+                // tile row: one image-newline per token-row
+                const int grid_w = img->ny() / img->nx();
+                const int tile_patches = img->nx() / (patch_size * 4); // patches per tile side (SAM divides by 4)
+                const int h = tile_patches;
+                n_patches = (tile_patches * grid_w + 1) * h;
+            }
         } break;
         case PROJECTOR_TYPE_HUNYUANVL:
             {
@@ -3926,6 +3977,24 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
 
                 set_input_i32("positions", positions);
             } break;
+        case PROJECTOR_TYPE_MINIMAX_M3:
+            {
+                const int n_merge = hparams.n_merge;
+                const int gh = image_size_height / patch_size;
+                const int gw = image_size_width  / patch_size;
+                std::vector<int32_t> pos_h, pos_w;
+                pos_h.reserve(gh * gw);
+                pos_w.reserve(gh * gw);
+                for (int bh = 0; bh < gh / n_merge; bh++)
+                for (int bw = 0; bw < gw / n_merge; bw++)
+                for (int mh = 0; mh < n_merge; mh++)
+                for (int mw = 0; mw < n_merge; mw++) {
+                    pos_h.push_back(bh * n_merge + mh);
+                    pos_w.push_back(bw * n_merge + mw);
+                }
+                set_input_i32("minimax_pos_h", pos_h);
+                set_input_i32("minimax_pos_w", pos_w);
+            } break;
         case PROJECTOR_TYPE_DOTS_OCR:
             {
                 const int pw = image_size_width / patch_size;
@@ -4184,7 +4253,10 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         case PROJECTOR_TYPE_DEEPSEEKOCR:
         case PROJECTOR_TYPE_DEEPSEEKOCR2:
             {
-                GGML_ASSERT(pos_w == pos_h);
+                GGML_ASSERT(
+                    (pos_w == pos_h) // overview image
+                    || (pos_h >= pos_w && pos_h % pos_w == 0) // tile images
+                );
 
                 const int window = hparams.attn_window_size;
                 const int pos = pos_w;
@@ -4626,6 +4698,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_ffn_down_w->ne[1];
         case PROJECTOR_TYPE_GLM_EDGE:
             return ctx->model.mm_model_mlp_3_w->ne[1];
+        case PROJECTOR_TYPE_MINIMAX_M3:
+            return ctx->model.mm_merger_fc2_b->ne[0];
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_EXAONE4_5:

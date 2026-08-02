@@ -69,6 +69,7 @@ struct clip_hparams {
     std::vector<clip_image_size> image_res_candidates;
     int32_t preproc_min_tiles = 0;
     int32_t preproc_max_tiles = 0;
+    int32_t preproc_tile_size = 0; // local tile size (deepseek-ocr)
     resize_algo image_resize_algo_rf = RESIZE_ALGO_BICUBIC;
     resize_algo image_resize_algo_ov = RESIZE_ALGO_BILINEAR;
     pad_style image_pad_rf = PAD_CEIL;  // padding style for the refined image (e.g. llava-1.6)
@@ -396,6 +397,10 @@ struct clip_model {
     ggml_tensor * mm_0_b = nullptr;
     ggml_tensor * mm_2_w = nullptr;
     ggml_tensor * mm_2_b = nullptr;
+    ggml_tensor * mm_merger_fc1_w = nullptr;   // minimax-m3
+    ggml_tensor * mm_merger_fc1_b = nullptr;
+    ggml_tensor * mm_merger_fc2_w = nullptr;
+    ggml_tensor * mm_merger_fc2_b = nullptr;
 
     ggml_tensor * image_newline = nullptr;
     ggml_tensor * view_seperator = nullptr;
